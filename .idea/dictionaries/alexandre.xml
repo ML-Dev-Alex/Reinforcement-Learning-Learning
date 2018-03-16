@@ -3,6 +3,7 @@
     <words>
       <w>downsample</w>
       <w>grayscale</w>
+      <w>keras</w>
       <w>preprocess</w>
     </words>
   </dictionary>
