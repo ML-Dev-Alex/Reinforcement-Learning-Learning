@@ -4,19 +4,19 @@ from collections import deque
 import gym
 import keras
 import numpy as np
-from keras import Sequential
+from keras import Model
 from keras import backend as K
-from keras.layers import Dense, Conv2D, Flatten
+from keras.layers import Dense, Conv2D, Flatten, Lambda, Input, multiply
 from keras.optimizers import RMSprop
 
 # Change to true to load a saved model
-LOAD = False
+LOAD = True
 
-EPISODES = 5
+EPISODES = 1000
 # SGD updates are sampled from this number of most recent frames
 MEMORY = 10000000
-# 5 minutes running on 60 FPS:
-MAX_TIME = 18000
+# 5 minutes running on 60 FPS, considering we only play every 4 frames:
+MAX_TIME = 4500
 # Deterministic-v4 is the version used by the original deepmind paper, which helps to deal with atari's limitations
 GAME = 'BreakoutDeterministic-v4'
 
@@ -24,9 +24,12 @@ memory = deque(maxlen=MEMORY)
 env = gym.make(GAME)
 
 state_size = env.observation_space.shape
-action_size = env.action_space.n
+# Halve size to accommodate for image preprocessing
+state_size = np.array(state_size)
+state_size[0] = state_size[0] / 2
+state_size[1] = state_size[1] / 2
 
-done = False
+action_size = env.action_space.n
 
 
 class Agent:
@@ -50,39 +53,50 @@ class Agent:
         self.optimizer_epsilon = 0.01
 
         # Image Pre-processing
-        self.frames_per_action = 30
         self.frames_per_state = 4
 
+        self.random_init_counter = 0
+        self.random_init = 50000
         self.batch_size = 32
         # Target network update Frequency
-        self.C = 10000
+        self.C = 10000 / self.frames_per_state
         self.C_counter = 0
+
+        # Just for debugging
+        self.debug_reward = 0
 
         if LOAD:
             self.model = keras.models.load_model('hlctdrl-model', custom_objects={'huber_loss': self.huber_loss})
-            self.model_target = keras.models.load_model('hlctdrl-model-target',
-                                                        custom_objects={'huber_loss': self.huber_loss})
         else:
             self.model = self.build_model(state_size, action_size)
-            self.model_target = self.model
 
-        self.Q = np.ones(action_size)
-        self.Q_hat = self.Q
+        self.model_target = self.copy_model(self.model)
 
     def build_model(self, state_size, action_size):
-        model = Sequential()
+        frames_input = Input(state_size, name='frames')
+        actions_input = Input((1,), name='mask')
+
+        # Normalization layer for more efficiency
+        normalized = Lambda(lambda x: x / 255.0)(frames_input)
+
         # Convolutional layers as per deepmind paper
-        model.add(Conv2D(16, 8, input_shape=state_size, strides=4, activation='relu'))
-        model.add(Conv2D(32, 4, strides=2, activation='relu'))
+        conv1 = Conv2D(16, 8, strides=4, activation='relu')(normalized)
+        conv2 = Conv2D(32, 4, strides=2, activation='relu')(conv1)
         # Flatten the convolutional layers to pass trough final layer
-        model.add(Flatten())
+        flattened = Flatten()(conv2)
+        hidden = Dense(256, activation='relu')(flattened)
         # Linear output layer
-        model.add(Dense(action_size))
-        model.compile(optimizer=RMSprop(lr=self.optimizer_lr, rho=self.optimizer_rho, epsilon=self.optimizer_epsilon),
-                      loss=self.huber_loss)
+        output = Dense(action_size)(hidden)
+        filtered_output = multiply([output, actions_input])
+
+        model = Model(input=[frames_input, actions_input], output=filtered_output)
+        optimizer = RMSprop(lr=self.optimizer_lr, rho=self.optimizer_rho, epsilon=self.optimizer_epsilon)
+
+        model.compile(optimizer, self.huber_loss)
+
         return model
 
-    def act(self, env, frame, timestep, memory):
+    def act(self, env, frame):
         # Explore less randomly over time
         if self.epsilon > self.epsilon_min:
             self.epsilon = self.epsilon_decay = self.epsilon
@@ -93,58 +107,53 @@ class Agent:
         else:
             # Only predict once every few frames to save computational
             # time and simulate a better human learning experience
-            self.Q = self.model.predict(frame)
-            action = np.argmax(self.Q)
+            action = np.argmax(self.model.predict(frame))
 
-        frame_new, reward, done, _ = env.step(action)
-        frame_new = self.preprocess(frame_new)
-
-        memory.append((frame, action, reward, frame_new, done))
-
-        # Train on the past transitions
-        if timestep / self.frames_per_state >= self.batch_size:
-            self.fit_batch(memory)
-
-        # Every few steps reset target model to trained model
-        self.C_counter += 1
-        if self.C_counter >= self.C:
-            self.C_counter = 0
-            self.model_target = self.copy_model(self.model)
+        return action
 
     def fit_batch(self, memory):
         minibatch = random.sample(memory, self.batch_size)
-        for i in range(0, self.batch_size):
+        for i in range(self.batch_size):
             frame = minibatch[i][0]
             action = minibatch[i][1]
             reward = minibatch[i][2]
             frame_new = minibatch[i][3]
             done = minibatch[i][4]
 
+            action = np.expand_dims(action, axis=0)
+            action[0] = i
             if done:
                 target = reward
             else:
-                target = reward + self.gamma * np.max(self.model_target.predict(frame_new))
+                action_next = self.model_target.predict([frame_new, np.ones(1, )])
+                target = reward + self.gamma * np.argmax([action_next])
 
-            target_future = self.model_target.predict(frame)
-            target_future[0][action] = target
+            loss = np.square(target - self.model_target.predict([frame, action]))
+            agent.debug_reward = target
+            self.model.fit([frame, action], loss, batch_size=1, verbose=0)
 
-            self.model.fit(frame, target_future, epochs=1, verbose=0)
-
+    # Consistent way to copy models with any keras version
     def copy_model(self, model):
         model.save('tmp_model')
         return keras.models.load_model('tmp_model', custom_objects={'huber_loss': self.huber_loss})
 
-    def preprocess(self, img):
+    def preprocess(self, img, img2):
         # Take the max between two frames to eliminate problems with atari flickering
-        temp, _, _, _ = env.step(np.argmax(agent.Q))
-        img = np.fmax(img, temp)
+        img = np.fmax(img, img2)
+        # Downscale image
+        img = img[::2, ::2]
         # RGB to Grayscale
-        # img = Image.fromarray(img).convert('L')
+        img[..., :] = np.mean(img, axis=2, keepdims=True).astype(np.uint8)
+
+        # Expand dims to fit the Conv2D input parameters
+        img = np.expand_dims(img, axis=0)
+
+        # Uncomment to see individual preprocessed frames
         # plt.figure()
         # plt.imshow(img)
         # plt.show()
 
-        img = np.expand_dims(img, axis=0)
+        # Don't normalize yet to save RAM
 
         return img
 
@@ -161,22 +170,49 @@ class Agent:
 agent = Agent(state_size, action_size)
 
 for episode in range(EPISODES):
-    print('Episode: {}  Reward: {}'.format(episode, 1))
+    print('Episode: {}  Reward: {}'.format(episode, agent.debug_reward))
     frame = env.reset()
-    agent.model.save('hlctdrl-model')
-    agent.model_target.save('hlctdrl-model-target')
+    frame2 = frame
 
     for timestep in range(MAX_TIME):
-        if episode == (EPISODES - 1):
+        # Render the last iteration and every time a model is saved/the target model gets updated
+        if episode == (EPISODES - 1) or agent.C_counter >= agent.C:
             env.render()
 
-        # Repeat same action a few times before moving on to simulate human experience
-        # and be more computationally efficient
-        if timestep % agent.frames_per_state == 0 and timestep >= agent.frames_per_state:
-            frame = agent.preprocess(frame)
-            agent.act(env, frame, timestep, memory)
+        # Repeat same action a few frames before next update to simulate human experience
+        # and be more computationally efficient; frames_per_state -1 because we take two steps per action
+        if timestep % agent.frames_per_state - 1 == 0 or timestep == 0:
+            frame = agent.preprocess(frame, frame2)
+            frame[0] = timestep
+            action = agent.act(env, frame)
+
+            # Do two frames per action to take the max between frames and fix flickering issues
+            frame_new, reward, done, _ = env.step(action)
+            frame_new2, reward, done, _ = env.step(action)
+            frame_new = agent.preprocess(frame_new, frame_new2)
+            frame_new[0] = timestep
+
+            memory.append((frame, action, reward, frame_new, done))
+
+            frame = frame_new2
+            frame2 = frame_new2
+
+            # Train on the past transitions after filling memory with 50000 random examples
+            if agent.random_init_counter >= agent.random_init:
+                agent.fit_batch(memory)
+            else:
+                agent.random_init_counter += 1
+
+            # Every few steps update target model to trained model to make it more likely to converge on the optimal Q*
+            agent.C_counter += 1
+            if agent.C_counter >= agent.C:
+                agent.C_counter = 0
+                agent.model_target = agent.copy_model(agent.model)
+                agent.model_target.save('hlctdrl-model')
+                print('model saved')
+
         else:
-            frame, _, _, _ = env.step(np.argmax(agent.Q))
+            frame, reward, done, _ = env.step(action)
 
         if done:
             env.render(close=True)
