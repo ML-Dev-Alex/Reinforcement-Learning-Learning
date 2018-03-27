@@ -10,13 +10,16 @@ from keras.layers import Dense, Conv2D, Flatten, Lambda, Input, multiply
 from keras.optimizers import RMSprop
 
 # Change to true to load a saved model
-LOAD = True
+LOAD = False
 
-EPISODES = 1000
+EPISODES = 1000000
+
 # SGD updates are sampled from this number of most recent frames
 MEMORY = 10000000
-# 5 minutes running on 60 FPS, considering we only play every 4 frames:
-MAX_TIME = 4500
+
+# 5 minutes running on 60 FPS
+MAX_TIME = 18000
+
 # Deterministic-v4 is the version used by the original deepmind paper, which helps to deal with atari's limitations
 GAME = 'BreakoutDeterministic-v4'
 
@@ -52,21 +55,30 @@ class Agent:
         self.optimizer_rho = 0.95
         self.optimizer_epsilon = 0.01
 
-        # Image Pre-processing
-        self.frames_per_state = 4
+        # Image Pre-processing, pairs of actions because we take two steps every time we act to fix atari flickering
+        self.pairs_per_state = 2
+        self.frame_count = 0
+
+        self.batch_size = 32
+
+        # Walk this many random steps before sampling batch for better exploration
+        if LOAD:
+            self.random_init = self.batch_size * 4
+        else:
+            self.random_init = 50000
 
         self.random_init_counter = 0
-        self.random_init = 50000
-        self.batch_size = 32
+
+
         # Target network update Frequency
-        self.C = 10000 / self.frames_per_state
+        self.C = 10000
         self.C_counter = 0
 
         # Just for debugging
         self.debug_reward = 0
 
         if LOAD:
-            self.model = keras.models.load_model('hlctdrl-model', custom_objects={'huber_loss': self.huber_loss})
+            self.model = keras.models.load_model('./save/hlctdrl-model', custom_objects={'huber_loss': self.huber_loss})
         else:
             self.model = self.build_model(state_size, action_size)
 
@@ -74,7 +86,7 @@ class Agent:
 
     def build_model(self, state_size, action_size):
         frames_input = Input(state_size, name='frames')
-        actions_input = Input((1,), name='mask')
+        actions_input = Input((action_size,), name='mask')
 
         # Normalization layer for more efficiency
         normalized = Lambda(lambda x: x / 255.0)(frames_input)
@@ -97,19 +109,25 @@ class Agent:
         return model
 
     def act(self, env, frame):
-        # Explore less randomly over time
-        if self.epsilon > self.epsilon_min:
-            self.epsilon = self.epsilon_decay = self.epsilon
-
-        # Take a random exploratory action sometimes, otherwise take best action it can
-        if random.random() < self.epsilon:
-            action = np.random.randint(0, env.action_space.n, size=1)[0]
+        # Act randomly for a while to build some memory
+        if agent.random_init_counter < agent.random_init:
+            act_value = np.random.randint(0, env.action_space.n, size=1)[0]
         else:
-            # Only predict once every few frames to save computational
-            # time and simulate a better human learning experience
-            action = np.argmax(self.model.predict(frame))
+            # Explore less randomly over time
+            if self.epsilon > self.epsilon_min:
+                self.epsilon = self.epsilon_decay * self.epsilon
 
-        return action
+            # Take a random exploratory action sometimes, otherwise take best action it can
+            if random.random() < self.epsilon:
+                act_value = np.random.randint(0, env.action_space.n, size=1)[0]
+            else:
+                # Use ones as a mask to ensure we are selecting the best learned parameters
+                ones = np.ones(action_size)
+                # Make sure to fit the shape required by the model ( 1 hot encoded vector of action values )
+                ones = np.reshape(ones, [1, action_size])
+                act_value = np.argmax(self.model.predict([frame, ones], batch_size=1), axis=1)
+
+        return act_value
 
     def fit_batch(self, memory):
         minibatch = random.sample(memory, self.batch_size)
@@ -120,22 +138,34 @@ class Agent:
             frame_new = minibatch[i][3]
             done = minibatch[i][4]
 
-            action = np.expand_dims(action, axis=0)
-            action[0] = i
+            # Make sure action fits in the model
+            action = np.reshape(action, [1, action_size])
             if done:
                 target = reward
             else:
-                action_next = self.model_target.predict([frame_new, np.ones(1, )])
-                target = reward + self.gamma * np.argmax([action_next])
+                # Pass ones as a mask to have the agent select the best action based on target model
+                ones = np.ones_like(action)
+                action_next = self.model_target.predict([frame_new, ones], batch_size=1)
+                # Try to learn from working backwards from best state to start state
+                # to find a clear path from action to reward, even if separated by many frames
+                # Also known as Bellman's equation
+                target = reward + self.gamma * np.argmax(action_next, axis=1)
 
-            loss = np.square(target - self.model_target.predict([frame, action]))
-            agent.debug_reward = target
-            self.model.fit([frame, action], loss, batch_size=1, verbose=0)
+            # Fit the model with the squared difference between the best predicted action (from the model_target)
+            # and the action taken by the current model, this is done to try to help the current model get better at
+            # predicting what the best action chosen by the model_target, such that we separate the tasks of learning
+            # how to chose the best value from the Q function and actually updating the Q function itself
+            y = action * target
+            # Just a way to visualize progress while training
+            agent.debug_reward += reward
+            self.model.fit([frame, action], y, batch_size=1, verbose=0)
 
     # Consistent way to copy models with any keras version
+    # Also a good opportunity to save the model since it only happens every so often
     def copy_model(self, model):
-        model.save('tmp_model')
-        return keras.models.load_model('tmp_model', custom_objects={'huber_loss': self.huber_loss})
+        model.save('./save/hlctdrl-model')
+        print('model saved')
+        return keras.models.load_model('./save/hlctdrl-model', custom_objects={'huber_loss': self.huber_loss})
 
     def preprocess(self, img, img2):
         # Take the max between two frames to eliminate problems with atari flickering
@@ -157,6 +187,7 @@ class Agent:
 
         return img
 
+    # Huber loss uses squared error when difference is big and normal distance when its large
     def huber_loss(self, a, b, in_keras=True):
         error = a - b
         quadratic_term = error * error / 2
@@ -173,47 +204,69 @@ for episode in range(EPISODES):
     print('Episode: {}  Reward: {}'.format(episode, agent.debug_reward))
     frame = env.reset()
     frame2 = frame
+    act_value = np.random.randint(0, env.action_space.n, size=1)[0]
+    agent.debug_reward = 0
+
+    if agent.C_counter >= agent.C:
+        agent.C_counter = 0
+        agent.model_target = agent.copy_model(agent.model)
 
     for timestep in range(MAX_TIME):
         # Render the last iteration and every time a model is saved/the target model gets updated
-        if episode == (EPISODES - 1) or agent.C_counter >= agent.C:
-            env.render()
+        # if episode == (EPISODES - 1) or agent.C_counter >= agent.C:
+        #     env.render()
+
+        # Increase the counter every frame, to be able to start learning once we have enough remembered states
+        if agent.random_init_counter <= agent.random_init:
+            agent.random_init_counter += 1
+
+            # Only start saving model after initial random memory is saved
+            # Only update the target model every 'C' steps to try to find the optimal Q* with more reliability
+
+        agent.C_counter += 1
+
 
         # Repeat same action a few frames before next update to simulate human experience
-        # and be more computationally efficient; frames_per_state -1 because we take two steps per action
-        if timestep % agent.frames_per_state - 1 == 0 or timestep == 0:
+        # and be more computationally efficient;
+        # Divided by 2 because we take two steps per repeated action and training action
+        if (timestep % agent.pairs_per_state == 0) or timestep == 0:
+            # Evaluate them as one to fix flickering issues
             frame = agent.preprocess(frame, frame2)
-            frame[0] = timestep
-            action = agent.act(env, frame)
 
-            # Do two frames per action to take the max between frames and fix flickering issues
-            frame_new, reward, done, _ = env.step(action)
-            frame_new2, reward, done, _ = env.step(action)
+            # Act
+            action = np.zeros(action_size)
+            act_value = agent.act(env, frame)
+            # Action is a one hot encoded vector with zeroes on all entries except the best possible value
+            action[act_value] = 1
+            # Take another two steps to complete full action transition
+            frame_new, _, _, _ = env.step(act_value)
+            frame_new2, reward, done, _ = env.step(act_value)
+            # Save them as 1 to fix flickering issues again
             frame_new = agent.preprocess(frame_new, frame_new2)
-            frame_new[0] = timestep
 
+            # Enumerate frames passed to the model for the Conv2D layer, should be 1 frame for every (n = 4) env steps
+            agent.frame_count += 1
+            frame[0] = agent.frame_count
+            frame_new[0] = agent.frame_count
+
+            # Record transition for batch training
             memory.append((frame, action, reward, frame_new, done))
 
-            frame = frame_new2
+            # In case we don't repeat any action
+            frame = frame_new
             frame2 = frame_new2
 
-            # Train on the past transitions after filling memory with 50000 random examples
+            # Train on the past transitions after filling memory with 'random_init'random examples
             if agent.random_init_counter >= agent.random_init:
                 agent.fit_batch(memory)
-            else:
-                agent.random_init_counter += 1
 
-            # Every few steps update target model to trained model to make it more likely to converge on the optimal Q*
-            agent.C_counter += 1
-            if agent.C_counter >= agent.C:
-                agent.C_counter = 0
-                agent.model_target = agent.copy_model(agent.model)
-                agent.model_target.save('hlctdrl-model')
-                print('model saved')
-
+        # Repeat same action for some steps
         else:
-            frame, reward, done, _ = env.step(action)
+            # You could take individual steps here, but the code would become more complicated for almost no reason
+            frame, _, _, _ = env.step(act_value)
+            frame2, reward, done, _ = env.step(act_value)
 
         if done:
+            # Break out of episode early in case of game over and make sure to close all open render windows
             env.render(close=True)
             break
