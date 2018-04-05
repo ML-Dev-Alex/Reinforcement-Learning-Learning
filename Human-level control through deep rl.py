@@ -10,9 +10,15 @@ from keras.layers import Dense, Conv2D, Flatten, Lambda, Input, multiply
 from keras.optimizers import RMSprop
 
 # Change to true to load a saved model
-LOAD = False
+LOAD = True
 
-EPISODES = 1000000
+# Change to see results
+TEST = False
+
+if TEST:
+    EPISODES = 1
+else:
+    EPISODES = 1000000
 
 # SGD updates are sampled from this number of most recent frames
 MEMORY = 10000000
@@ -62,13 +68,8 @@ class Agent:
         self.batch_size = 32
 
         # Walk this many random steps before sampling batch for better exploration
-        if LOAD:
-            self.random_init = self.batch_size * 4
-        else:
-            self.random_init = 50000
-
+        self.random_init = 50000
         self.random_init_counter = 0
-
 
         # Target network update Frequency
         self.C = 10000
@@ -76,9 +77,12 @@ class Agent:
 
         # Just for debugging
         self.debug_reward = 0
+        self.debug_counter = 0
+        self.debug_mean = 0
 
-        if LOAD:
-            self.model = keras.models.load_model('./save/hlctdrl-model', custom_objects={'huber_loss': self.huber_loss})
+        if LOAD or TEST:
+            self.model = keras.models.load_model('./models/hlctdrl-model.h5',
+                                                 custom_objects={'huber_loss': self.huber_loss})
         else:
             self.model = self.build_model(state_size, action_size)
 
@@ -94,9 +98,11 @@ class Agent:
         # Convolutional layers as per deepmind paper
         conv1 = Conv2D(16, 8, strides=4, activation='relu')(normalized)
         conv2 = Conv2D(32, 4, strides=2, activation='relu')(conv1)
+
         # Flatten the convolutional layers to pass trough final layer
         flattened = Flatten()(conv2)
         hidden = Dense(256, activation='relu')(flattened)
+
         # Linear output layer
         output = Dense(action_size)(hidden)
         filtered_output = multiply([output, actions_input])
@@ -109,25 +115,33 @@ class Agent:
         return model
 
     def act(self, env, frame):
-        # Act randomly for a while to build some memory
-        if agent.random_init_counter < agent.random_init:
-            act_value = np.random.randint(0, env.action_space.n, size=1)[0]
+        if TEST:
+            # Use ones as a mask to ensure we are selecting the best learned parameters
+            ones = np.ones(action_size)
+            # Make sure to fit the shape required by the model ( 1 hot encoded vector of action values )
+            ones = np.reshape(ones, [1, action_size])
+            value = np.argmax(self.model.predict([frame, ones], batch_size=1), axis=1)
+
         else:
-            # Explore less randomly over time
-            if self.epsilon > self.epsilon_min:
-                self.epsilon = self.epsilon_decay * self.epsilon
-
-            # Take a random exploratory action sometimes, otherwise take best action it can
-            if random.random() < self.epsilon:
-                act_value = np.random.randint(0, env.action_space.n, size=1)[0]
+            # Act randomly for a while to build some memory
+            if agent.random_init_counter < agent.random_init:
+                value = np.random.randint(0, env.action_space.n, size=1)[0]
             else:
-                # Use ones as a mask to ensure we are selecting the best learned parameters
-                ones = np.ones(action_size)
-                # Make sure to fit the shape required by the model ( 1 hot encoded vector of action values )
-                ones = np.reshape(ones, [1, action_size])
-                act_value = np.argmax(self.model.predict([frame, ones], batch_size=1), axis=1)
+                # Explore less randomly over time
+                if self.epsilon > self.epsilon_min:
+                    self.epsilon = self.epsilon_decay * self.epsilon
 
-        return act_value
+                # Take a random exploratory action sometimes, otherwise take best action it can
+                if random.random() < self.epsilon:
+                    value = np.random.randint(0, env.action_space.n, size=1)[0]
+                else:
+                    # Use ones as a mask to ensure we are selecting the best learned parameters
+                    ones = np.ones(action_size)
+                    # Make sure to fit the shape required by the model ( 1 hot encoded vector of action values )
+                    ones = np.reshape(ones, [1, action_size])
+                    value = np.argmax(self.model.predict([frame, ones], batch_size=1), axis=1)
+
+        return value
 
     def fit_batch(self, memory):
         minibatch = random.sample(memory, self.batch_size)
@@ -151,21 +165,25 @@ class Agent:
                 # Also known as Bellman's equation
                 target = reward + self.gamma * np.argmax(action_next, axis=1)
 
-            # Fit the model with the squared difference between the best predicted action (from the model_target)
-            # and the action taken by the current model, this is done to try to help the current model get better at
-            # predicting what the best action chosen by the model_target, such that we separate the tasks of learning
-            # how to chose the best value from the Q function and actually updating the Q function itself
-            y = action * target
             # Just a way to visualize progress while training
             agent.debug_reward += reward
+
+            # Try to predict whats the best action chosen by the model_target, such that we separate the tasks of
+            # learning how to chose the best value from the Q function and actually updating the Q function itself
+            y = action * target
+
             self.model.fit([frame, action], y, batch_size=1, verbose=0)
 
     # Consistent way to copy models with any keras version
-    # Also a good opportunity to save the model since it only happens every so often
+    # Also a good opportunity to save model weights since it only happens every so often
     def copy_model(self, model):
-        model.save('./save/hlctdrl-model')
-        print('model saved')
-        return keras.models.load_model('./save/hlctdrl-model', custom_objects={'huber_loss': self.huber_loss})
+        model.save('./models/hlctdrl-model.h5')
+        if self.debug_counter >= 1:
+            self.debug_mean = self.debug_mean / self.debug_counter
+            print('model saved, mean = {}, over {} episodes'.format(self.debug_mean, self.debug_counter))
+            self.debug_mean, self.debug_counter = 0, 0
+
+        return keras.models.load_model('./models/hlctdrl-model.h5', custom_objects={'huber_loss': self.huber_loss})
 
     def preprocess(self, img, img2):
         # Take the max between two frames to eliminate problems with atari flickering
@@ -201,6 +219,8 @@ class Agent:
 agent = Agent(state_size, action_size)
 
 for episode in range(EPISODES):
+    agent.debug_counter += 1
+    agent.debug_mean += agent.debug_reward
     print('Episode: {}  Reward: {}'.format(episode, agent.debug_reward))
     frame = env.reset()
     frame2 = frame
@@ -212,59 +232,61 @@ for episode in range(EPISODES):
         agent.model_target = agent.copy_model(agent.model)
 
     for timestep in range(MAX_TIME):
-        # Render the last iteration and every time a model is saved/the target model gets updated
-        # if episode == (EPISODES - 1) or agent.C_counter >= agent.C:
-        #     env.render()
-
-        # Increase the counter every frame, to be able to start learning once we have enough remembered states
-        if agent.random_init_counter <= agent.random_init:
-            agent.random_init_counter += 1
-
-            # Only start saving model after initial random memory is saved
-            # Only update the target model every 'C' steps to try to find the optimal Q* with more reliability
-
-        agent.C_counter += 1
-
-
-        # Repeat same action a few frames before next update to simulate human experience
-        # and be more computationally efficient;
-        # Divided by 2 because we take two steps per repeated action and training action
-        if (timestep % agent.pairs_per_state == 0) or timestep == 0:
-            # Evaluate them as one to fix flickering issues
+        if TEST:
+            env.render()
             frame = agent.preprocess(frame, frame2)
-
-            # Act
-            action = np.zeros(action_size)
             act_value = agent.act(env, frame)
-            # Action is a one hot encoded vector with zeroes on all entries except the best possible value
-            action[act_value] = 1
-            # Take another two steps to complete full action transition
-            frame_new, _, _, _ = env.step(act_value)
-            frame_new2, reward, done, _ = env.step(act_value)
-            # Save them as 1 to fix flickering issues again
-            frame_new = agent.preprocess(frame_new, frame_new2)
-
-            # Enumerate frames passed to the model for the Conv2D layer, should be 1 frame for every (n = 4) env steps
-            agent.frame_count += 1
-            frame[0] = agent.frame_count
-            frame_new[0] = agent.frame_count
-
-            # Record transition for batch training
-            memory.append((frame, action, reward, frame_new, done))
-
-            # In case we don't repeat any action
-            frame = frame_new
-            frame2 = frame_new2
-
-            # Train on the past transitions after filling memory with 'random_init'random examples
-            if agent.random_init_counter >= agent.random_init:
-                agent.fit_batch(memory)
-
-        # Repeat same action for some steps
-        else:
-            # You could take individual steps here, but the code would become more complicated for almost no reason
             frame, _, _, _ = env.step(act_value)
             frame2, reward, done, _ = env.step(act_value)
+
+        else:
+            # Increase the counter every frame, to be able to start learning once we have enough remembered states
+            if agent.random_init_counter <= agent.random_init:
+                agent.random_init_counter += 1
+
+            # Only update the target model every 'C' steps to try to find the optimal Q* with more reliability
+            agent.C_counter += 1
+
+            # Repeat same action a few frames before next update to simulate human experience
+            # and be more computationally efficient;
+            # Divided by 2 because we take two steps per repeated action and training action
+            if (timestep % agent.pairs_per_state == 0) or timestep == 0:
+                # Evaluate them as one to fix flickering issues
+                frame = agent.preprocess(frame, frame2)
+
+                # Act
+                action = np.zeros(action_size)
+                act_value = agent.act(env, frame)
+                # Action is a one hot encoded vector with zeroes on all entries except the best possible value
+                action[act_value] = 1
+
+                # Take another two steps to complete full action transition
+                frame_new, _, _, _ = env.step(act_value)
+                frame_new2, reward, done, _ = env.step(act_value)
+                # Save them as 1 to fix flickering issues again
+                frame_new = agent.preprocess(frame_new, frame_new2)
+
+                # Enumerate frames passed to the model for the Conv2D layer, should be 1 frame for every n env steps
+                agent.frame_count += 1
+                frame[0] = agent.frame_count
+                frame_new[0] = agent.frame_count
+
+                # Record transition for batch training
+                memory.append((frame, action, reward, frame_new, done))
+
+                # In case we don't repeat any action
+                frame = frame_new
+                frame2 = frame_new2
+
+                # Train on the past transitions after filling memory with 'random_init'random examples
+                if agent.random_init_counter >= agent.random_init:
+                    agent.fit_batch(memory)
+
+            # Repeat same action for some steps
+            else:
+                # You could take individual steps here, but the code would become more complicated for almost no reason
+                frame, _, _, _ = env.step(act_value)
+                frame2, reward, done, _ = env.step(act_value)
 
         if done:
             # Break out of episode early in case of game over and make sure to close all open render windows
